@@ -1,0 +1,16 @@
+{
+  "name": "kelp-url-shortener",
+  "version": "1.0.0",
+  "description": "A minimal server-side URL shortener with click analytics (Node.js + Express).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
