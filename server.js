@@ -1,50 +1,38 @@
 "use strict";
 
 const express = require("express");
-const fs = require("fs");
 const path = require("path");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- 簡易ストレージ（DBレスでデモを成立させる） ----
-// data/links.json にJSONで永続化。読み込み失敗時は空で起動する。
-const DATA_DIR = path.join(__dirname, "data");
-const DATA_FILE = path.join(DATA_DIR, "links.json");
+// ---- PostgreSQL接続 ----
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || "postgres://snip:snip@localhost:5432/snip",
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("sslmode=require")
+    ? { rejectUnauthorized: false }
+    : false,
+});
 
-/** @type {Map<string, {url:string, clicks:number, createdAt:string}>} */
-let links = new Map();
-
-function loadLinks() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf-8");
-    const obj = JSON.parse(raw);
-    links = new Map(Object.entries(obj));
-  } catch (_) {
-    links = new Map();
-  }
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS links (
+      code        TEXT PRIMARY KEY,
+      url         TEXT NOT NULL,
+      clicks      INTEGER NOT NULL DEFAULT 0,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 }
 
-function saveLinks() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(Object.fromEntries(links), null, 2));
-  } catch (err) {
-    // 書き込み失敗してもプロセスは落とさない（読み取り専用FS対策）
-    console.error("persist failed:", err.message);
-  }
-}
-
-// 衝突しない6文字のbase62コードを生成
+// 6文字のbase62コードを生成
 const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-function generateCode(len = 6) {
-  let code;
-  do {
-    code = "";
-    for (let i = 0; i < len; i++) {
-      code += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-    }
-  } while (links.has(code));
+function randomCode(len = 6) {
+  let code = "";
+  for (let i = 0; i < len; i++) {
+    code += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+  }
   return code;
 }
 
@@ -57,7 +45,7 @@ function isValidHttpUrl(value) {
   }
 }
 
-// 予約パス（短縮コードとして払い出さない）
+// 予約パス
 const RESERVED = new Set(["api", "favicon.ico", "robots.txt", "health"]);
 
 // ---- ミドルウェア ----
@@ -66,53 +54,79 @@ app.use(express.static(path.join(__dirname, "public")));
 
 // ---- API ----
 
-// ヘルスチェック（デプロイ先の監視用）
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// ヘルスチェック
+app.get("/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true });
+  } catch (_) {
+    res.status(500).json({ ok: false });
+  }
+});
 
 // 短縮URLの作成
-app.post("/api/shorten", (req, res) => {
+app.post("/api/shorten", async (req, res) => {
   const url = (req.body && req.body.url ? String(req.body.url) : "").trim();
   if (!url) return res.status(400).json({ error: "URLを入力してください。" });
   if (!isValidHttpUrl(url)) {
     return res.status(400).json({ error: "http(s):// から始まる正しいURLを入力してください。" });
   }
-  const code = generateCode();
-  links.set(code, { url, clicks: 0, createdAt: new Date().toISOString() });
-  saveLinks();
-  res.status(201).json({ code, url, clicks: 0 });
+
+  const MAX_RETRIES = 5;
+  for (let i = 0; i < MAX_RETRIES; i++) {
+    const code = randomCode();
+    try {
+      const result = await pool.query(
+        "INSERT INTO links (code, url) VALUES ($1, $2) RETURNING code, url, clicks",
+        [code, url]
+      );
+      const row = result.rows[0];
+      return res.status(201).json({ code: row.code, url: row.url, clicks: row.clicks });
+    } catch (err) {
+      if (err.code === "23505") continue; // PK衝突時はリトライ
+      throw err;
+    }
+  }
+  res.status(500).json({ error: "コードの生成に失敗しました。再度お試しください。" });
 });
 
 // 一覧（新しい順）
-app.get("/api/links", (_req, res) => {
-  const list = [...links.entries()]
-    .map(([code, v]) => ({ code, ...v }))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(list);
+app.get("/api/links", async (_req, res) => {
+  const result = await pool.query(
+    "SELECT code, url, clicks, created_at AS \"createdAt\" FROM links ORDER BY created_at DESC"
+  );
+  res.json(result.rows);
 });
 
 // 削除
-app.delete("/api/links/:code", (req, res) => {
-  const ok = links.delete(req.params.code);
-  if (ok) saveLinks();
-  res.json({ deleted: ok });
+app.delete("/api/links/:code", async (req, res) => {
+  const result = await pool.query("DELETE FROM links WHERE code = $1", [req.params.code]);
+  res.json({ deleted: result.rowCount > 0 });
 });
 
-// ---- 短縮URLのリダイレクト（ここがサーバーサイドの肝） ----
-app.get("/:code", (req, res, next) => {
+// ---- 短縮URLのリダイレクト ----
+app.get("/:code", async (req, res, next) => {
   const { code } = req.params;
   if (RESERVED.has(code)) return next();
-  const entry = links.get(code);
-  if (!entry) {
+  const result = await pool.query(
+    "UPDATE links SET clicks = clicks + 1 WHERE code = $1 RETURNING url",
+    [code]
+  );
+  if (result.rowCount === 0) {
     return res
       .status(404)
       .send("<h1>404</h1><p>このリンクは存在しません。</p><p><a href='/'>トップへ</a></p>");
   }
-  entry.clicks += 1;
-  saveLinks();
-  res.redirect(302, entry.url);
+  res.redirect(302, result.rows[0].url);
 });
 
-loadLinks();
-app.listen(PORT, () => {
-  console.log(`URL shortener running on port ${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`URL shortener running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("DB初期化失敗:", err.message);
+    process.exit(1);
+  });
